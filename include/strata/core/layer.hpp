@@ -291,6 +291,9 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 /// sizing and initialization; nullptr restores the private-arena default.
 /// Drafters (ring_cells != 0), streamed and elastic states are never pooled.
 void qsa_set_kv_pool(GlobalKvPool* pool);
+/// Price pooled main states before the per-stage pool objects exist (split
+/// search). Initialization still requires qsa_set_kv_pool() to name a pool.
+void qsa_set_kv_pool_sizing(bool enabled);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully

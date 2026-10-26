@@ -12,7 +12,7 @@
 #include <new>
 #include <utility>
 
-#if defined(STRATA_ENABLE_CUDA) || defined(STRATA_ENABLE_HIP) || defined(STRATA_HIP_GFX906)
+#if defined(STRATA_USE_CUDA) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
 #include <cuda_runtime.h>
 #define STRATA_KV_POOL_GPU 1
 #else
@@ -260,7 +260,7 @@ std::unique_ptr<GlobalKvPool> GlobalKvPool::create(int device, const ModelGeomet
         }
     } else {
 #if !STRATA_KV_POOL_GPU
-        error = "kv_pool: create requires CUDA/HIP or an injected device backend";
+        error = "kv_pool: create built without a GPU backend (CUDA/HIP); use a GPU build or an injected device backend";
         return nullptr;
 #endif
     }

@@ -34,6 +34,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
+#include "../core/kv_pool.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -50,6 +51,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -2719,6 +2721,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
+        for (int64_t i = 0; i < ss.qsa_alloc; ++i) {
+            core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + i];
+            if (st.kv_pool != nullptr && !st.kv_pool->ensure(st, p0, p0 + T, m.cs, err)) return false;
+            assert(st.kv_pool == nullptr || (st.kv_pool_write_top >= p0 + T &&
+                                             st.kv_pool_page_mirror != nullptr));
+        }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2 prompt taps: the rows of this chunk at positions >= tap_first_ (the drafter looks back one window)

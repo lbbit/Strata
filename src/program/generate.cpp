@@ -38,6 +38,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
+#include "../core/kv_pool.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
@@ -486,6 +487,8 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    bool kv_pool = false;              ///< shared logical-page K/V pool for main mode-0 QSA states
+    int64_t kv_pool_mib = -1;          ///< per-stage capacity; -1 uses the reserved-memory budget
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -833,6 +836,8 @@ void usage() {
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "  --kv-pool            allocate main QSA K/V from one shared logical-page pool per stage\n"
+                 "  --kv-pool-mib N      per-stage KV pool capacity in MiB (default: half the reserved free room)\n"
                  "  --kv-grow            the K/V takes VRAM only for the cells the requests reach and the expert\n"
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
@@ -1216,6 +1221,7 @@ struct GpuStage {
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
     strata::core::SessionState ss;
+    std::unique_ptr<strata::core::GlobalKvPool> kv_pool;
     cudaStream_t stream = nullptr;
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
@@ -2479,6 +2485,15 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-pool") o.kv_pool = true;
+        else if (a == "--kv-pool-mib") {
+            const char* value = next("--kv-pool-mib");
+            const char* end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, o.kv_pool_mib);
+            if (parsed.ec != std::errc{} || parsed.ptr != end) {
+                std::fprintf(stderr, "strata generate: --kv-pool-mib requires a decimal int64\n"); return 2;
+            }
+        }
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
@@ -3200,6 +3215,29 @@ int main(int argc, char** argv) {
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
         return 2;
+    }
+    if (o.kv_pool) {
+        const char* grow = std::getenv("STRATA_KV_GROW");
+        const bool grow_on = grow != nullptr && grow[0] != '\0' ? grow[0] != '0' : o.kv_grow;
+        const char* rows = std::getenv("STRATA_BATCH_ATTN_ROWS");
+        if (o.kv_resident > 0) {
+            std::fprintf(stderr, "strata generate: --kv-pool is mutually exclusive with --kv-resident / K/V streaming\n"); return 2;
+        }
+        if (grow_on) {
+            std::fprintf(stderr, "strata generate: --kv-pool is mutually exclusive with --kv-grow / STRATA_KV_GROW\n"); return 2;
+        }
+        if (rows != nullptr && std::atoi(rows) != 0) {
+            std::fprintf(stderr, "strata generate: --kv-pool is mutually exclusive with STRATA_BATCH_ATTN_ROWS=1\n"); return 2;
+        }
+        if (o.kv_pool_mib == 0 || o.kv_pool_mib < -1 || o.kv_pool_mib > std::numeric_limits<int64_t>::max() / (1 << 20)) {
+            std::fprintf(stderr, "strata generate: --kv-pool-mib must be a positive, non-overflowing MiB value\n"); return 2;
+        }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_CUDA)
+        std::fprintf(stderr, "strata generate: --kv-pool requires a CUDA or HIP backend\n"); return 2;
+#endif
+        // Split-search session_bytes() calls precede construction of the pools.
+        // Initialization still binds only to an actual per-stage pool below.
+        strata::core::qsa_set_kv_pool_sizing(true);
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
@@ -5186,6 +5224,60 @@ int main(int argc, char** argv) {
                                  "follows)\n", st.dev, (double) fb / 1073741824.0);
         }
 
+    // Pool bases are fixed for every captured graph.  Construct them before any
+    // session is priced or carved, and reserve the later workspaces/slot arenas
+    // before choosing an automatic capacity.
+    std::unique_ptr<strata::core::GlobalKvPool> primary_kv_pool;
+    const int64_t kv_slot_count = o.kv_pool ? std::max(o.batch, 0) : 0;
+    const int64_t kv_slot_hi0 = multi_gpu ? split_at[0] : -1;
+    const uint64_t kv_pooled_session0 = o.kv_pool
+        ? strata::core::session_bytes(g, o.max_context, K, 0, kv_slot_hi0) : 0;
+    const int64_t kv_reserved0 = kv_slot_count * (int64_t) kv_pooled_session0 +
+        ((o.vram_reserve_mib + split_pf_mib + kPipeWindowMib + kPipeSnapMib +
+          (mtp_first ? kDrafterMib : 0)) << 20);
+    auto create_kv_pool = [&](int device, int stage, int64_t lo, int64_t hi,
+                              int64_t reserved) -> std::unique_ptr<strata::core::GlobalKvPool> {
+        if (!o.kv_pool) return nullptr;
+        const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
+        const int64_t layers = std::max<int64_t>(hi / I - lo / I, g.n_qsa_layers() > 0 ? 1 : 0);
+        const strata::core::OnDevice on(device);
+        int64_t capacity = o.kv_pool_mib >= 0 ? o.kv_pool_mib << 20 : 0;
+        if (capacity == 0) {
+            size_t free_bytes = 0, total_bytes = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: KV pool: CUDA%d free memory query failed: %s\n",
+                             device, cudaGetErrorString(cudaGetLastError()));
+                return nullptr;
+            }
+            const int64_t available = (int64_t) free_bytes - reserved;
+            capacity = std::max<int64_t>(available, 0) / 2;
+        }
+        std::string pool_err;
+        auto pool = strata::core::GlobalKvPool::create(device, g, layers, capacity, pool_err);
+        if (!pool) {
+            std::fprintf(stderr, "strata generate: KV pool: CUDA%d stage=%d: %s\n",
+                         device, stage, pool_err.c_str());
+            return nullptr;
+        }
+        std::fprintf(stderr, "strata generate: KV pool: CUDA%d stage=%d qsa_layers=%lld capacity_mib=%lld "
+                             "page_bytes=%llu pages=%lld free=%lld high_water=%lld\n",
+                     device, stage, (long long) layers, (long long) (capacity >> 20),
+                     (unsigned long long) pool->page_price(), (long long) pool->pages(),
+                     (long long) pool->free_pages(), (long long) pool->high_water_pages());
+        return pool;
+    };
+    primary_kv_pool = create_kv_pool(primary_device, 0, 0, multi_gpu ? split_at[0] : g.n_layers, kv_reserved0);
+    if (o.kv_pool && !primary_kv_pool) return 1;
+    for (size_t i = 0; i < stages.size(); ++i) {
+        GpuStage& st = *stages[i];
+        const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, st.lb, st.le);
+        const int64_t reserve = kv_slot_count * session +
+            (((stages[i]->dev >= 0 && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib) +
+              split_pf_mib + kWindowMib + kPipeWindowMib + (i + 1 == stages.size() && !mtp_first ? kDrafterMib : 0)) << 20);
+        st.kv_pool = create_kv_pool(st.dev, (int) i + 1, st.lb, st.le, reserve);
+        if (o.kv_pool && !st.kv_pool) return 1;
+    }
+
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
@@ -5193,6 +5285,7 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        strata::core::qsa_set_kv_pool(primary_kv_pool.get());
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
@@ -5247,6 +5340,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
+        strata::core::qsa_set_kv_pool(st.kv_pool.get());
         void* sbuf_s = nullptr;
         if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
             strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
@@ -5392,6 +5486,7 @@ int main(int argc, char** argv) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
+            strata::core::qsa_set_kv_pool(k == 0 ? primary_kv_pool.get() : stages[k - 1]->kv_pool.get());
             const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
@@ -5440,6 +5535,10 @@ int main(int argc, char** argv) {
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
+
+    // Drafters retain their private ring K/V, including a hypothetical mode-0 draft.
+    strata::core::qsa_set_kv_pool(nullptr);
+    strata::core::qsa_set_kv_pool_sizing(false);
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.

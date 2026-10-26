@@ -4,6 +4,7 @@
 #include "strata/core/sm120_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "kv_pool.hpp"
 #include "strata/core/pin_budget.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
@@ -62,6 +63,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <map>
 #include <mutex>
 #include <string>
@@ -2843,6 +2845,12 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    for (int64_t i = 0; i < ss_->qsa_alloc; ++i) {
+        QsaState& st = ss_->qsa_states[ss_->qsa_ord0 + i];
+        if (st.kv_pool != nullptr && !st.kv_pool->ensure(st, pos0, pos0 + T, cs_, err)) return false;
+        assert(st.kv_pool == nullptr || (st.kv_pool_write_top >= pos0 + T &&
+                                         st.kv_pool_page_mirror != nullptr));
+    }
     const Clock::time_point t0 = Clock::now();
     stage_inputs(T, tokens, pos0);
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);
@@ -2881,6 +2889,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // or this thread would serve the window as the other variant
     const bool pre = prelaunched_ == T;
     prelaunched_ = 0;
+    if (!pre) {
+        for (int64_t i = 0; i < ss.qsa_alloc; ++i) {
+            QsaState& st = ss.qsa_states[ss.qsa_ord0 + i];
+            if (st.kv_pool != nullptr && !st.kv_pool->ensure(st, pos0, pos0 + T, cs_, err)) return false;
+            assert(st.kv_pool == nullptr || (st.kv_pool_write_top >= pos0 + T &&
+                                             st.kv_pool_page_mirror != nullptr));
+        }
+    }
     if (!pre && pre_launch_ && !pre_launch_(cs_, err)) return false;   // (a prelaunched window's was served with the first stage's)
     if (!pre) refresh_ar();
     if (!capture(T, err) || !capture_commit(err)) return false;
@@ -2888,6 +2904,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
         const OnDevice on_next(next_->device_);
         next_->refresh_ar();                     // #871: the variant its prelaunch and its run() will both use
+        for (int64_t i = 0; i < next_->ss_->qsa_alloc; ++i) {
+            QsaState& st = next_->ss_->qsa_states[next_->ss_->qsa_ord0 + i];
+            if (st.kv_pool != nullptr && !st.kv_pool->ensure(st, pos0, pos0 + T, next_->cs_, err)) return false;
+            assert(st.kv_pool == nullptr || (st.kv_pool_write_top >= pos0 + T &&
+                                             st.kv_pool_page_mirror != nullptr));
+        }
         if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
     }
     VDBG("captured; staging\n");
@@ -3709,6 +3731,20 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             err = "verify: slot " + std::to_string(rows[t]) + " runs past its context";
             return false;
         }
+    for (int first = 0; first < S;) {
+        int last = first + 1;
+        while (last < S && rows[last] == rows[first]) ++last;
+        SessionState& sx = *slots_[(size_t) rows[first]];
+        const int64_t committed = pos[first];
+        const int64_t write = pos[last - 1] + 1;
+        for (int64_t i = 0; i < sx.qsa_alloc; ++i) {
+            QsaState& st = sx.qsa_states[sx.qsa_ord0 + i];
+            if (st.kv_pool != nullptr && !st.kv_pool->ensure(st, committed, write, cs_, err)) return false;
+            assert(st.kv_pool == nullptr || (st.kv_pool_write_top >= write &&
+                                             st.kv_pool_page_mirror != nullptr));
+        }
+        first = last;
+    }
     refresh_ar();
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
@@ -4235,6 +4271,12 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
         err = "verify: pipelined window not prepared (capture_all)";
         return false;
+    }
+    for (int64_t i = 0; i < ss.qsa_alloc; ++i) {
+        QsaState& st = ss.qsa_states[ss.qsa_ord0 + i];
+        if (st.kv_pool != nullptr && !st.kv_pool->ensure(st, pos0, pos0 + T, cs_, err)) return false;
+        assert(st.kv_pool == nullptr || (st.kv_pool_write_top >= pos0 + T &&
+                                         st.kv_pool_page_mirror != nullptr));
     }
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     const Clock::time_point t0 = Clock::now();

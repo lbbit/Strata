@@ -625,6 +625,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
 GlobalKvPool* g_kv_pool = nullptr;   // initialization binding; no pool is created here
+bool g_kv_pool_sizing = false;      // split search precedes pool construction
 int64_t g_kv_elastic_init = 16384;
 struct ElasticPool {
     strata::core::VmmRange range;
@@ -769,6 +770,7 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 }  // namespace
 
 void qsa_set_kv_pool(GlobalKvPool* pool) { g_kv_pool = pool; }
+void qsa_set_kv_pool_sizing(bool enabled) { g_kv_pool_sizing = enabled; }
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
@@ -781,7 +783,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
                     : g_kv_int8 ? KvPoolFormat::Int8 : KvPoolFormat::Fp16;
     config.resident_cells = g_kv_resident;
     config.elastic = g_kv_elastic;
-    config.pooled = g_kv_pool != nullptr;
+    config.pooled = g_kv_pool_sizing || g_kv_pool != nullptr;
     return qsa_state_sizing_bytes(g, max_cells, with_rope, ring_cells, config);
 }
 

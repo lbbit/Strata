@@ -117,6 +117,15 @@ uint64_t reference_price(const QsaShapes& s, KvPoolFormat format) {
     return values + rows * (uint64_t) (s.head_dim / 64) * 2 + q4;
 }
 
+void test_backend_diagnostic() {
+    std::string error;
+    check(!GlobalKvPool::create(0, ModelGeometry{}, 12, 8192, error,
+                                KvPoolDeviceOps{}, KvPoolFormat::Fp16),
+          "a host-only build cannot create a device pool without injected ops");
+    check(error.find("built without a GPU backend") != std::string::npos,
+          "missing GPU backend diagnostic identifies the build configuration");
+}
+
 void test_prices_and_capacity() {
     QsaShapes s = qsa_real_shapes();
     for (KvPoolFormat format : {KvPoolFormat::Fp16, KvPoolFormat::Int8,
@@ -405,6 +414,7 @@ void test_randomized_accounting() {
 }  // namespace
 
 int main() {
+    test_backend_diagnostic();
     test_prices_and_capacity();
     test_accounting_and_exhaustion();
     test_batch_rollback();
