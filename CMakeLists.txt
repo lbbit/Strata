@@ -330,6 +330,16 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+# Pure host allocator/transaction tests: injected storage and format selection,
+# no runtime library and no GPU access.  Engine integration starts in step 2.
+enable_testing()
+add_executable(kv_pool_test src/core/kv_pool_test.cpp src/core/kv_pool.cpp)
+target_include_directories(kv_pool_test PRIVATE include src/core)
+target_compile_definitions(kv_pool_test PRIVATE STRATA_KV_POOL_HOST_TEST=1)
+target_link_libraries(kv_pool_test PRIVATE strata_warnings)
+add_test(NAME kv_pool_test COMMAND kv_pool_test)
+set_tests_properties(kv_pool_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1" TIMEOUT 120)
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
