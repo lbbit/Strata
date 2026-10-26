@@ -97,6 +97,49 @@ int32_t table_entry(const std::vector<int32_t>& table, int64_t logical_page) {
 
 }  // namespace
 
+uint64_t qsa_state_sizing_bytes(const ModelGeometry& g, int64_t max_cells,
+                                bool with_rope, int64_t ring_cells,
+                                const KvStateSizingConfig& config) {
+    const auto s = qsa_shapes(g);
+    int64_t pages = (max_cells + s.page_size - 1) / s.page_size;
+    int64_t slots = pages;
+    int64_t pooled_rows = max_cells / s.idx_block + 2;
+    int mode = 0;
+    if (config.resident_cells > 0 && ring_cells >= 0) {
+        if (ring_cells > 0) {
+            const int64_t resident = (ring_cells + s.page_size - 1) / s.page_size;
+            if (resident < pages) { mode = 2; slots = resident; pooled_rows = 2; }
+        } else {
+            const int64_t resident = (std::max(config.resident_cells, int64_t{20480}) +
+                                      s.page_size - 1) / s.page_size;
+            if (resident < pages) { mode = 1; slots = resident; }
+        }
+    }
+    const bool pooled = config.pooled && ring_cells == 0 && mode == 0 && !config.elastic;
+    const bool elastic = config.elastic && mode == 0;
+    const bool hybrid = config.format == KvPoolFormat::Hybrid && ring_cells <= 0;
+    const KvPoolFormat format = hybrid ? KvPoolFormat::Hybrid
+                                      : ring_cells > 0 && config.format != KvPoolFormat::Fp16
+                                        ? KvPoolFormat::Int8 : config.format;
+    uint64_t n = 0;
+    if (!pooled && !elastic) {
+        uint64_t storage = 0;
+        std::string error;
+        if (!kv_pool_storage_bytes(s, slots, format, storage, error)) return 0;
+        n += storage + 4 * 16;
+    }
+    n += (uint64_t) pages * 4;
+    if (mode == 1) n += strata::kernels::kv_stream_map_bytes(slots) + 6 * 16;
+    n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;
+    n += (uint64_t) s.idx_dim * 4;
+    n += (uint64_t) pooled_rows * s.idx_dim * 4;
+    n += 16;
+    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;
+    n += strata::kernels::qsa_step_bytes() + 16;
+    n += (uint64_t) s.n_head * 4;
+    return (n + 15) / 16 * 16 + 256;
+}
+
 bool kv_pool_page_price(const strata::kernels::QsaShapes& s, KvPoolFormat format,
                         uint64_t& bytes, std::string& error) {
     bytes = 0;
@@ -297,7 +340,7 @@ std::unique_ptr<GlobalKvPool> GlobalKvPool::create(int device, const ModelGeomet
     }
     // Pop order is ascending, which makes fixtures and diagnostics stable; the
     // allocator never relies on physical identity for correctness.
-    for (int64_t i = count; i-- > 0;) pool->free_[(size_t) i] = (int32_t) i;
+    for (int64_t i = count; i-- > 0;) pool->free_[(size_t) i] = count - 1 - i;
     return pool;
 }
 
@@ -353,10 +396,13 @@ int32_t GlobalKvPool::physical_page(const QsaState& st, int64_t logical_page) co
 }
 
 void GlobalKvPool::bind_main_state(QsaState& st) {
-    // No pool-owned lease is installed here.  Without the step-2 QsaState
-    // metadata, owns() intentionally means "has a live lease".
+    // Binding owns addresses and an initially empty host mirror, not pages.
     assert(st.kv_mode == 0 && st.kv_elastic < 0 && st.page_table != nullptr);
-    if (st.kv_mode != 0 || st.kv_elastic < 0 || !st.page_table) return;
+    if (st.kv_mode != 0 || st.kv_elastic >= 0 || !st.page_table) return;
+    st.kv_pool = this;
+    st.kv_pool_committed = 0;
+    st.kv_pool_write_top = 0;
+    st.kv_pool_page_mirror = nullptr;
     st.k_pool = static_cast<uint16_t*>(parts_[0]);
     st.v_pool = parts_.size() > 1 ? static_cast<uint16_t*>(parts_[1]) : nullptr;
     st.k_q = st.v_q = nullptr;
@@ -375,16 +421,35 @@ void GlobalKvPool::bind_main_state(QsaState& st) {
     }
 }
 
+bool GlobalKvPool::bind_identity_for_test(QsaState& st, void* caller_stream,
+                                          std::string& error) {
+    if (!ensure(st, 0, st.max_cells, caller_stream, error)) return false;
+    std::lock_guard lock(mutex_);
+    const auto it = leases_.find(&st);
+    if (it == leases_.end()) {
+        error = "kv_pool: identity fixture has no lease";
+        return false;
+    }
+    for (size_t i = 0; i < it->second.table.size(); ++i) {
+        if (it->second.table[i] != (int32_t) i) {
+            error = "kv_pool: identity fixture requires exclusive pages [0,n_pages)";
+            return false;
+        }
+        st.kv_pool_page_mirror = &it->second.table;
+    }
+    return true;
+}
+
 void GlobalKvPool::recycle(std::vector<int32_t>& pages) {
     for (int32_t p : pages) free_.push_back(p);
     pages.clear();
 }
 
 void GlobalKvPool::reset(QsaState& st) {
-    st.k_pool = st.v_pool = nullptr;
-    st.k_q = st.v_q = nullptr;
-    st.k_scale = st.v_scale = nullptr;
-    st.k_q4 = st.v_q4 = nullptr;
+    // The binding and stable pool bases survive release; only the lease ends.
+    st.kv_pool_committed = 0;
+    st.kv_pool_write_top = 0;
+    st.kv_pool_page_mirror = nullptr;
 }
 
 bool GlobalKvPool::reserve(Lease& lease, QsaState& st, int64_t committed_cells,
@@ -476,6 +541,7 @@ bool GlobalKvPool::ensure(QsaState& st, int64_t committed_cells, int64_t new_wri
     if (!reserve(candidate, st, committed_cells, new_write_cells, error)) {
         // reserve() has already restored free_ and candidate on capacity error.
         // No live table or device entry has been touched.
+        free_ = free_before;
         if (!had_lease) leases_.erase(&st);
         return false;
     }
@@ -491,6 +557,9 @@ bool GlobalKvPool::ensure(QsaState& st, int64_t committed_cells, int64_t new_wri
         return false;
     }
     it->second = std::move(candidate);
+    st.kv_pool_committed = it->second.committed_cells;
+    st.kv_pool_write_top = it->second.write_top;
+    st.kv_pool_page_mirror = &it->second.table;
     return true;
 }
 
@@ -550,7 +619,11 @@ bool GlobalKvPool::publish_prepared(QsaState& st, KvLeaseTxn& txn, void* caller_
         leases_.erase(old);
         txn.retired.emplace_back(&st, std::move(retired.pages));
     }
-    leases_[&st] = std::move(replacement);
+    Lease& live = leases_[&st];
+    live = std::move(replacement);
+    st.kv_pool_committed = live.committed_cells;
+    st.kv_pool_write_top = live.write_top;
+    st.kv_pool_page_mirror = &live.table;
     txn.entries.erase(entry);
     if (txn.entries.empty()) txn.prepared = false;
     return true;

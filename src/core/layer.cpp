@@ -4,6 +4,7 @@
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
+#include "kv_pool.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -623,6 +624,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
 
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
+GlobalKvPool* g_kv_pool = nullptr;   // initialization binding; no pool is created here
 int64_t g_kv_elastic_init = 16384;
 struct ElasticPool {
     strata::core::VmmRange range;
@@ -766,34 +768,28 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 }
 }  // namespace
 
+void qsa_set_kv_pool(GlobalKvPool* pool) { g_kv_pool = pool; }
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
-    const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
-    uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
-        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
-    n += (uint64_t) p.pages * 4;                                               // page_table
-    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
-    n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
-    n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
-    n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
-    n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
-    n += (uint64_t) s.n_head * 4;                                              // pos_dev
-    return align_up16(n) + 256;
+    KvStateSizingConfig config;
+    config.format = g_kv_hybrid ? KvPoolFormat::Hybrid
+                    : g_kv_q4 ? KvPoolFormat::Q4
+                    : g_kv_int8 ? KvPoolFormat::Int8 : KvPoolFormat::Fp16;
+    config.resident_cells = g_kv_resident;
+    config.elastic = g_kv_elastic;
+    config.pooled = g_kv_pool != nullptr;
+    return qsa_state_sizing_bytes(g, max_cells, with_rope, ring_cells, config);
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const bool pooled = g_kv_pool != nullptr && ring_cells == 0 && p.mode == 0 && !g_kv_elastic;
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
@@ -811,7 +807,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
-    if (g_kv_elastic && p.mode == 0) {
+    if (pooled) {
+        // page_table is carved below; binding happens only once it is valid.
+        // No K/V Cursor::take() here: this must mirror qsa_state_bytes().
+    } else if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
         const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -863,6 +862,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.v_pool = c.take<uint16_t>(rows * s.head_dim);
     }
     st.page_table = c.take<int32_t>((uint64_t) pages);
+    if (pooled) {
+        g_kv_pool->bind_main_state(st);
+        if (st.kv_pool != g_kv_pool) {
+            std::fprintf(stderr, "strata: the main QSA state could not bind its KV pool\n");
+            return 0;
+        }
+    }
     st.n_pages = pages;
     st.max_cells = max_cells;
     st.map = strata::kernels::KvStreamMap{};
@@ -970,19 +976,19 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
     const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
-    if (st.kv_hybrid) {
+    if (!st.kv_pool && st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
-    } else if (st.kv_q4) {
+    } else if (!st.kv_pool && st.kv_q4) {
         cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
-    } else if (st.kv_int8) {
+    } else if (!st.kv_pool && st.kv_int8) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-    } else {
+    } else if (!st.kv_pool) {
         cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
         cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
     }

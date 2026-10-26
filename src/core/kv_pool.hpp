@@ -21,6 +21,20 @@ struct QsaState;
 // describe one layer's pages; qsa_layers is deliberately not a multiplier.
 enum class KvPoolFormat { Fp16, Int8, Q4, Hybrid };
 
+struct KvStateSizingConfig {
+    KvPoolFormat format = KvPoolFormat::Fp16;
+    int64_t resident_cells = 0;
+    bool elastic = false;
+    bool pooled = false;
+};
+
+uint64_t qsa_state_sizing_bytes(const ModelGeometry& g, int64_t max_cells,
+                                bool with_rope, int64_t ring_cells,
+                                const KvStateSizingConfig& config);
+
+// The single qsa_state_bytes() sizing implementation, also host-testable.
+// pooled removes only K/V; page_table, indexer, RoPE and step are unchanged.
+
 bool kv_pool_page_price(const strata::kernels::QsaShapes& shapes, KvPoolFormat format,
                         uint64_t& bytes, std::string& error);
 bool kv_pool_storage_bytes(const strata::kernels::QsaShapes& shapes, int64_t pages,
@@ -83,6 +97,10 @@ public:
     // Binds addresses only; it deliberately takes no pages.  A mode-0 main
     // QSA state's caller is responsible for not passing a drafter in step 2.
     void bind_main_state(QsaState& st);
+    // Step-2 development fixture only: reserve every logical page of one
+    // exclusively owned state and publish table[i] = i. Never use this for
+    // concurrent sessions; step 3 replaces it with ensure() at write points.
+    bool bind_identity_for_test(QsaState& st, void* caller_stream, std::string& error);
     int64_t pages() const { return pages_; }
     int64_t free_pages() const;
     int64_t high_water_pages() const;

@@ -221,6 +221,9 @@ void test_abort_and_publish() {
     f.pool->finish_prepared(txn);
     check(f.pool->free_pages() == old_free - 3 && txn.retired.empty(),
           "finishing after scatter releases the old four pages");
+    check(f.a.kv_pool_page_mirror != nullptr && f.a.kv_pool_committed == 28 && f.a.kv_pool_write_top == 28,
+          "state handles name the live host mirror and committed/write tops");
+    check(*f.a.kv_pool_page_mirror == f.table_a, "state mirror handle aliases the authoritative table");
     check(f.table_b == old_b, "publish leaves other state untouched");
     for (size_t i = 0; i < 7; ++i) {
         check(f.table_a[i] >= 0 && f.table_a[i] < f.pool->pages(), "published page is in range");
@@ -291,6 +294,81 @@ void test_gather_scatter() {
                  "scatter refuses unmapped page across boundary");
 }
 
+void test_layer_sizing_and_identity_fixture() {
+    ModelGeometry g;
+    constexpr int64_t cells = 65536;
+    const QsaShapes s = qsa_real_shapes();
+    const int64_t pages = (cells + s.page_size - 1) / s.page_size;
+    for (KvPoolFormat format : {KvPoolFormat::Fp16, KvPoolFormat::Int8,
+                                KvPoolFormat::Q4, KvPoolFormat::Hybrid}) {
+        KvStateSizingConfig off{format};
+        KvStateSizingConfig on{format, 0, false, true};
+        const uint64_t private_bytes = qsa_state_sizing_bytes(g, cells, true, 0, off);
+        const uint64_t pooled_bytes = qsa_state_sizing_bytes(g, cells, true, 0, on);
+        uint64_t kv_bytes = 0;
+        std::string error;
+        check(kv_pool_storage_bytes(s, pages, format, kv_bytes, error), "test format storage bytes");
+        const uint64_t expected_delta = kv_bytes + 4 * 16;
+        std::printf("kv_pool sizing format=%d off=%llu on=%llu delta=%llu non_kv_delta=%llu\n",
+                    (int) format, (unsigned long long) private_bytes, (unsigned long long) pooled_bytes,
+                    (unsigned long long) (private_bytes - pooled_bytes), 0ull);
+        check(private_bytes - pooled_bytes == expected_delta,
+              "pool off/on differ by exactly the private K/V allocation");
+        // This is the non-KV equality assertion, not a second capacity formula:
+        // removing the measured K/V delta must make the two byte counts equal.
+        check(private_bytes - expected_delta == pooled_bytes,
+              "all non-KV qsa_state_bytes fields are exactly equal");
+        check(qsa_state_sizing_bytes(g, cells, false, 0, off) -
+              qsa_state_sizing_bytes(g, cells, false, 0, on) == expected_delta,
+              "non-KV equality also holds with borrowed RoPE");
+        check(qsa_state_sizing_bytes(g, cells, true, 128, off) ==
+              qsa_state_sizing_bytes(g, cells, true, 128, on),
+              "drafter sizing never changes under a pool binding");
+        KvStateSizingConfig streamed{format, 128, false, false};
+        KvStateSizingConfig streamed_pool = streamed;
+        streamed_pool.pooled = true;
+        check(qsa_state_sizing_bytes(g, cells, true, 0, streamed) ==
+              qsa_state_sizing_bytes(g, cells, true, 0, streamed_pool),
+              "streamed sizing never changes under a pool binding");
+        KvStateSizingConfig elastic{format, 0, true, false};
+        KvStateSizingConfig elastic_pool = elastic;
+        elastic_pool.pooled = true;
+        check(qsa_state_sizing_bytes(g, cells, true, 0, elastic) ==
+              qsa_state_sizing_bytes(g, cells, true, 0, elastic_pool),
+              "elastic sizing never changes under a pool binding");
+    }
+
+    // One state exclusively owns this small pool: [0,n_pages) is therefore
+    // both the logical and physical range. This is not a multi-session mode.
+    HostDevice device;
+    std::string error;
+    uint64_t page_price = 0;
+    check(kv_pool_page_price(s, KvPoolFormat::Fp16, page_price, error), "identity fixture page price");
+    auto pool = GlobalKvPool::create(0, g, 1, pages * (int64_t) page_price,
+                                     error, device.ops(), KvPoolFormat::Fp16);
+    check(pool && pool->pages() == pages, "identity fixture has exactly one page per logical page");
+    check(pool != nullptr, "identity fixture pool creation");
+    QsaState st;
+    std::vector<int32_t> table((size_t) pages, -1);
+    st.page_table = table.data();
+    st.n_pages = pages;
+    st.max_cells = cells;
+    pool->bind_main_state(st);
+    check(st.kv_pool == pool.get() && st.kv_pool_page_mirror == nullptr && st.k_pool != nullptr,
+          "binding has stable shared bases and an empty lease");
+    check(pool->bind_identity_for_test(st, nullptr, error), "exclusive identity lease");
+    check(std::all_of(table.begin(), table.end(), [i = 0](int32_t p) mutable { return p == i++; }),
+          "identity lease publishes table[i]=i for every logical page");
+    check(st.kv_pool_page_mirror != nullptr && *st.kv_pool_page_mirror == table,
+          "identity host mirror is attached to QsaState");
+    check(pool->free_pages() == 0 && st.kv_pool_write_top == cells,
+          "identity fixture accounts every page");
+    uint8_t* original_pool = reinterpret_cast<uint8_t*>(st.k_pool);
+    check(pool->release(st, nullptr, error), "identity fixture release");
+    check(reinterpret_cast<uint8_t*>(st.k_pool) == original_pool && st.kv_pool_page_mirror == nullptr &&
+          pool->free_pages() == pool->pages(), "release keeps the binding and stable base");
+}
+
 void test_randomized_accounting() {
     Fixture f(64);
     std::mt19937 rng(0x5eed);
@@ -333,6 +411,7 @@ int main() {
     test_abort_and_publish();
     test_publish_failure();
     test_gather_scatter();
+    test_layer_sizing_and_identity_fixture();
     test_randomized_accounting();
     std::printf("kv_pool_test: %d checks passed\n", checks);
     return 0;

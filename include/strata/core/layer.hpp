@@ -47,8 +47,11 @@
 #include <cstdlib>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
+
+struct GlobalKvPool;
 
 /// Select pinned CUDA BF16/F32 projections for SSM gates, routing and the sparse indexer.
 /// Configure before session capture; captured graphs retain the selected implementation.
@@ -236,6 +239,13 @@ struct QsaState {
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
     int kv_mode = 0;
     int64_t n_slots = 0;
+    /// Optional shared mode-0 K/V storage. The arena still owns page_table and
+    /// every field below; these bases are borrowed from kv_pool. The host
+    /// mirror is the pool's logical -> physical page-table authority.
+    GlobalKvPool* kv_pool = nullptr;
+    int64_t kv_pool_committed = 0;
+    int64_t kv_pool_write_top = 0;
+    std::vector<int32_t>* kv_pool_page_mirror = nullptr;
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
@@ -277,6 +287,10 @@ struct QsaState {
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// Select shared storage for the next main mode-0 QSA states. Set before both
+/// sizing and initialization; nullptr restores the private-arena default.
+/// Drafters (ring_cells != 0), streamed and elastic states are never pooled.
+void qsa_set_kv_pool(GlobalKvPool* pool);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -329,8 +343,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
                     int64_t cap, void* stream);
-/// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
-/// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
+/// Zeroes private K/V pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.
+/// A pool-bound state never clears shared storage here: acquired pages are zeroed by the pool before use.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
