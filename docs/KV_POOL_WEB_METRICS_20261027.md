@@ -31,3 +31,19 @@
 - 方案：步骤 6 让引擎周期性（或按请求结束）重发 INFO 行，或新增轻量 `POOL` 查询指令回一行
   `POOL free=.. high_water=..`；serve 的 `_pump()` 更新 `engine.info` 快照；前端/Monitor 自然刷新。
 - 步骤 6 单测：gauge 与 INFO 一致、请求结束按真实 lease 回落、无池/旧引擎仍用旧公式。
+
+## 更新（步骤 6 已完成，commit 3adf992e）
+动态刷新已实现：引擎在每条 DONE **之前**输出一行 `POOL free=.. high_water=.. pages=..`（仅 --kv-pool）；
+serve 的两个请求读循环解析该行，更新 engine.info 的 kv_pool_free/pages/high_water。
+- 关键坑：POOL 必须放在 DONE **之前**——serve 的 generate 循环读到 DONE 就 return，DONE 之后的行会滞留队列。
+- 实测：请求前 /metrics free=2552180，请求后 free=2551952/hw=228；/metrics/prometheus 同步更新。
+- 无池：POOL 行 0，默认 stdout 不变。
+
+## 前端验证（About 页截图 docs/kv_pool_about_screenshot.png）
+About(Model and engine) 面板新增一行，风格与既有行一致：
+  `KV cache   8-bit, all in VRAM`
+  `KV pool    228 / 2,552,180 pages in use (0%), shared logical-page pool`
+  `Experts in VRAM  3,389 (8.4 GB)`
+用 playwright 打开 `/`→About 页确认渲染正确、样式未破坏。百分比在演示大池下单请求占比小显示 0%，
+真实负载下随占用上升。
+
