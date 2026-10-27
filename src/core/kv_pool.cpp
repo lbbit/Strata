@@ -5,7 +5,9 @@
 #include "strata/kernels/kv_q8.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -544,6 +546,23 @@ bool GlobalKvPool::ensure(QsaState& st, int64_t committed_cells, int64_t new_wri
         free_ = free_before;
         if (!had_lease) leases_.erase(&st);
         return false;
+    }
+    // Step-5 deterministic failure gate: STRATA_TEST_KV_POOL_FAIL_AFTER=N makes the N-th
+    // successful reservation (this one counted) fail BEFORE any publish, then rolls back exactly
+    // like a capacity error. Tests use it to prove the caller reserves-then-launches atomically:
+    // reservation rollback, no launch, no KV write, free accounting balanced.
+    {
+        static std::atomic<int64_t> injected_counter{0};
+        static const int64_t fail_after = [] {
+            const char* v = std::getenv("STRATA_TEST_KV_POOL_FAIL_AFTER");
+            return v != nullptr ? std::strtoll(v, nullptr, 10) : (int64_t) 0;
+        }();
+        if (fail_after > 0 && ++injected_counter == fail_after) {
+            free_ = free_before;
+            if (!had_lease) leases_.erase(&st);
+            error = "kv_pool: injected failure (STRATA_TEST_KV_POOL_FAIL_AFTER)";
+            return false;
+        }
     }
     std::vector<std::pair<int64_t, int32_t>> updates;
     for (size_t i = 0; i < candidate.table.size(); ++i) {

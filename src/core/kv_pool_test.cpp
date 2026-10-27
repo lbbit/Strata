@@ -11,6 +11,10 @@
 #include <set>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 using namespace strata::core;
 using strata::kernels::QsaShapes;
@@ -29,6 +33,38 @@ void check(bool condition, const char* message) {
 
 void expect_error(bool result, const std::string& error, const char* message) {
     check(!result && !error.empty(), message);
+}
+
+// Subprocess helper for the STRATA_TEST_KV_POOL_FAIL_AFTER gate: the injection counter is a
+// static that must start fresh, so it is exercised in a child of this same binary.
+std::string self_exe() {
+#if defined(__linux__)
+    char buf[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) return std::string(buf, (size_t) n);
+#endif
+    return std::string();
+}
+
+int run_with_env(const std::string& exe, std::initializer_list<const char*> env) {
+#if defined(__linux__)
+    std::vector<std::string> store;
+    for (const char* e : env) store.emplace_back(e);
+    std::vector<char*> envp;
+    for (auto& s : store) envp.push_back(const_cast<char*>(s.c_str()));
+    envp.push_back(nullptr);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::execle(exe.c_str(), exe.c_str(), (char*) nullptr, envp.data());
+        ::_exit(127);
+    }
+    if (pid < 0) return -1;
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#else
+    (void) exe; (void) env; return -1;
+#endif
 }
 
 struct HostDevice {
@@ -191,6 +227,35 @@ void test_batch_rollback() {
     std::vector<int32_t> empty;
     expect_error(f.pool->snapshot_page_table(f.b, empty, error), error,
                  "failed first-time ensure has no mirror");
+}
+
+void test_fail_after_gate() {
+    // STRATA_TEST_KV_POOL_FAIL_AFTER=N: the N-th successful reservation fails before publish and
+    // rolls back. A subprocess (fresh static counter) proves: reservation rollback, no lease/mapping
+    // change, free accounting balanced, and a later ensure still works (nothing latched/broken).
+    const std::string exe = self_exe();
+    if (exe.empty()) { check(true, "fail-after gate: self exe unknown, skipped"); return; }
+    {
+        const int rc = run_with_env(exe, {"STRATA_TEST_KV_POOL_FAIL_AFTER=2", "STRATA_KV_POOL_FAIL_AFTER_CHILD=1"});
+        check(rc == 0, "fail-after gate: injected 2nd reservation, engine keeps working (child rc 0)");
+    }
+}
+
+int fail_after_child() {
+    // Runs only in the spawned child (STRATA_KV_POOL_FAIL_AFTER=2): 1st ensure succeeds, 2nd must
+    // fail with the injected error and leave free/table/ownership unchanged; 3rd succeeds again.
+    Fixture f(40);
+    std::string error;
+    check(f.pool->ensure(f.a, 0, 4, nullptr, error), "fail-after: first reservation succeeds");
+    const int64_t free_after_first = f.pool->free_pages();
+    const std::vector<int32_t> table_after_first = f.table_a;
+    const bool failed = !f.pool->ensure(f.a, 4, 8, nullptr, error);
+    check(failed && error.find("injected failure") != std::string::npos, "fail-after: 2nd reservation injected-fails");
+    check(f.pool->free_pages() == free_after_first && f.table_a == table_after_first,
+          "fail-after: injected failure rolls back free and mapping exactly");
+    check(f.pool->ensure(f.a, 4, 8, nullptr, error), "fail-after: 3rd reservation succeeds (nothing latched)");
+    check(f.pool->free_pages() < free_after_first, "fail-after: recovery actually acquires pages");
+    return 0;
 }
 
 void test_abort_and_publish() {
@@ -414,10 +479,12 @@ void test_randomized_accounting() {
 }  // namespace
 
 int main() {
+    if (std::getenv("STRATA_KV_POOL_FAIL_AFTER_CHILD") != nullptr) return fail_after_child();
     test_backend_diagnostic();
     test_prices_and_capacity();
     test_accounting_and_exhaustion();
     test_batch_rollback();
+    test_fail_after_gate();
     test_abort_and_publish();
     test_publish_failure();
     test_gather_scatter();
