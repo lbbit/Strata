@@ -46,3 +46,20 @@ acquire memset）是净增加。**该场景不满足"TTFT/TPOT 回归 ≤2%"的�
    - 批量：一次 ensure 合并更多 chunk 的页，减少同步次数。
 3. 这些优化超出当前"实现正确"的范围，属后续性能专项；本次步骤先把功能与正确性做扎实、如实记录性能现状。
 
+## 优化尝试记录（已做、已回退，结论：负优化）
+尝试了两处"最安全"的改动并 A/B 复测（32768，medians over 2 rounds）：
+1. `publish()` 增量页表上传（只传变化的 logical 项，大改动回退整表）。
+2. `reserve()` 记录 changed 列表，`ensure()` 不再整表遍历求 updates。
+
+**结果：B_on decode 反而更慢（22-27 vs 优化前 26-29 tok/s）。** 结论：这两处是**负优化**——
+瓶颈不在页表上传字节数，而在：
+- `ensure()` 每次 `Lease candidate = it->second`（**整表 2.4MB memcpy**）；
+- `const std::vector<int32_t> free_before = free_`（**整空闲列表拷贝**，O(n_pages)）；
+- 两者都是每 QSA 层 × 每 verify 窗口一次，O(n_pages) 在关键路径上。
+而"逐项小 H2D"反而增加 API 调用开销。
+
+**已 git checkout 回退**这两处（kv_pool.cpp/hpp 回到已提交版本），回归全过
+（kvp 1807028 / file 201 / val 972 / snap 4286）。真正要提速需把 `ensure` 重构为**增量记账**
+（原地改表 + changed 记录旧值回滚，去掉 candidate/free_before 整拷贝），属高风险重构，未做。
+
+
