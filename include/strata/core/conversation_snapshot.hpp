@@ -25,6 +25,11 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// Internal whole-session entry: callers validate every image first. All pooled
+// replacement leases are prepared before any target mapping or bytes change.
+bool conversation_kv_restore_many(const std::vector<const ConversationKv*>& images,
+                                  const std::vector<QsaState*>& states, const ModelGeometry& g,
+                                  int64_t captured, int64_t upto, bool include_index, std::string& error);
 // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
 // The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
 // `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,

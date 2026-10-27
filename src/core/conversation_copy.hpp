@@ -13,6 +13,7 @@
 #include <vector>
 
 namespace strata::core::conversation_detail {
+inline constexpr cudaError_t invalid_copy_range = static_cast<cudaError_t>(1);
 
 /// Conversation snapshot / checkpoint copies go through a private non-blocking stream of the current device
 /// instead of the legacy (null) stream.  A plain cudaMemcpy is ordered against every blocking stream of the
@@ -46,6 +47,58 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     e = cudaStreamSynchronize(s);
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
     return e;
+}
+
+// Copy an identity-layout logical byte interval to/from one physical KV part.
+// Up to eight arbitrary physical pages are queued before each host wait. The
+// caller's identity-layout host interval may be only one buffer segment.
+inline cudaError_t copy_logical_range(void* physical, size_t page_bytes,
+                                      const std::vector<int32_t>* table,
+                                      uint64_t logical_offset, void* logical_base,
+                                      uint64_t bytes, bool scatter, bool queued = false,
+                                      const std::vector<int32_t>* source_table = nullptr) {
+    cudaStream_t stream = nullptr;
+    cudaError_t e = private_stream(stream);
+    if (e != cudaSuccess || !page_bytes) return e != cudaSuccess ? e : invalid_copy_range;
+    uint64_t done = 0;
+    while (done < bytes) {
+        int batch = 0;
+        while (done < bytes && batch < 8) {
+            const uint64_t at = logical_offset + done;
+            if (at < logical_offset) return invalid_copy_range;
+            const uint64_t logical = at / page_bytes;
+            const size_t within = (size_t) (at % page_bytes);
+            if (logical >= table->size() || (*table)[(size_t) logical] < 0 ||
+                (source_table && (logical >= source_table->size() ||
+                                  (*source_table)[(size_t) logical] < 0)))
+                return invalid_copy_range;
+            const size_t n = (size_t) std::min<uint64_t>(bytes - done, page_bytes - within);
+            auto* device = static_cast<uint8_t*>(physical) +
+                           (uint64_t) (*table)[(size_t) logical] * page_bytes + within;
+            auto* h = static_cast<uint8_t*>(logical_base) + done;
+            const void* source = source_table
+                ? static_cast<const uint8_t*>(logical_base) +
+                  (uint64_t) (*source_table)[(size_t) logical] * page_bytes + within
+                : static_cast<const void*>(h);
+            e = cudaMemcpyAsync(scatter ? device : h, scatter ? source : device, n,
+                                cudaMemcpyDefault, stream);
+            if (e != cudaSuccess) return e;
+            done += n;
+            ++batch;
+        }
+        if (!queued) {
+            e = cudaStreamSynchronize(stream);
+            if (e != cudaSuccess) return e;
+            core::progress_beat();
+        }
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t synchronize_private_stream() {
+    cudaStream_t s = nullptr;
+    const cudaError_t e = private_stream(s);
+    return e != cudaSuccess ? e : cudaStreamSynchronize(s);
 }
 
 /// #2049 #2065 #1971: a host-to-host copy that tells the watchdog it is moving.  Parked state (the running

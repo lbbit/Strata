@@ -1,6 +1,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "kv_pool.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -23,9 +24,10 @@ void check(bool ok, const char* label) {
     ++checks;
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
 }
-void cuda_check(cudaError_t e) {
-    if (e != cudaSuccess) { std::fprintf(stderr, "CUDA: %s\n", cudaGetErrorString(e)); std::exit(1); }
+void cuda_check_at(cudaError_t e, int line) {
+    if (e != cudaSuccess) { std::fprintf(stderr, "CUDA line %d: %s\n", line, cudaGetErrorString(e)); std::exit(1); }
 }
+#define cuda_check(e) cuda_check_at((e), __LINE__)
 struct Fixture {
     ModelGeometry g;
     QsaState state;
@@ -108,6 +110,235 @@ struct Fixture {
 };
 bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
+}
+
+struct PooledFixture {
+    ModelGeometry g;
+    std::unique_ptr<GlobalKvPool> pool;
+    QsaState a, b, c;
+    std::vector<int32_t*> tables;
+    std::vector<float*> indexers;
+    std::string err;
+
+    PooledFixture(int fmt, int pages) {
+        const int64_t price=(int64_t)part_price(fmt);
+        pool=GlobalKvPool::create(0,g,1,pages*price,err,{},format_of(fmt));
+        check(pool!=nullptr,"create real GPU pool for snapshot fixture");
+        a=state(fmt,pages); b=state(fmt,pages); c=state(fmt,pages);
+        for (QsaState* st : {&a,&b,&c}) {
+            pool->bind_main_state(*st);
+            tables.push_back(st->page_table); indexers.push_back(st->idx_pooled);
+        }
+    }
+    static KvPoolFormat format_of(int fmt) {
+        return fmt==kKvInt8?KvPoolFormat::Int8:fmt==kKvQ4?KvPoolFormat::Q4:fmt==3?KvPoolFormat::Hybrid:KvPoolFormat::Fp16;
+    }
+    static size_t part_price(int fmt) {
+        ModelGeometry g;
+        uint64_t n=0; std::string e;
+        check(kv_pool_page_price(qsa_shapes(g),format_of(fmt),n,e),"snapshot fixture page price");
+        return n;
+    }
+    QsaState state(int fmt,int pages) {
+        QsaState st;
+        st.kv_int8=fmt==kKvInt8; st.kv_q4=fmt==kKvQ4; st.kv_hybrid=fmt==3;
+        st.n_pages=st.n_slots=pages; st.max_cells=pages*4; st.idx_pooled_rows=pages+2;
+        cuda_check(cudaMalloc((void**)&st.page_table,st.n_pages*sizeof(int32_t)));
+        cuda_check(cudaMalloc((void**)&st.idx_pooled,st.idx_pooled_rows*g.idx_key_dim*sizeof(float)));
+        return st;
+    }
+    QsaState& nth(int n) { return n==0?a:n==1?b:c; }
+    void mapping(QsaState& st,int pages,uint32_t seed) {
+        check(st.kv_pool_page_mirror!=nullptr,"live host mirror for fixed mapping");
+        auto& table=*st.kv_pool_page_mirror;
+        std::vector<int32_t> permutation((size_t)pages);
+        for (int i=0;i<pages;++i) permutation[(size_t)i]=i;
+        for (int i=pages-1;i>0;--i) {
+            seed=seed*1664525u+1013904223u;
+            std::swap(permutation[(size_t)i],permutation[(size_t)(seed%(uint32_t)(i+1))]);
+        }
+        std::vector<int32_t> old(table.begin(),table.begin()+pages);
+        for (int i=0;i<pages;++i) table[(size_t)i]=old[(size_t)permutation[(size_t)i]];
+        cuda_check(cudaMemcpy(st.page_table,table.data(),table.size()*sizeof(int32_t),cudaMemcpyHostToDevice));
+    }
+    size_t part_page_bytes(int fmt,int part) const {
+        if (part<2) {
+            const size_t per=fmt==kKvQ4||fmt==3&&part==1 ? kv_q4_bytes_per_head((int)g.head_dim)
+                                                          : g.head_dim*((fmt==kKvInt8||fmt==3)?1:2);
+            return 4*(size_t)g.n_head_kv*per;
+        }
+        if (part<4) return (part==2 && (fmt==kKvInt8||fmt==3)) || (part==3 && fmt==kKvInt8)
+                            ? 4*(size_t)g.n_head_kv*(g.head_dim/64)*2 : 0;
+        return 0;
+    }
+    void* part_base(QsaState& st,int fmt,int part) {
+        if (fmt==3) return part==0?(void*)st.k_q:part==1?(void*)st.v_q4:part==2?(void*)st.k_scale:nullptr;
+        if (fmt==kKvQ4) return part==0?(void*)st.k_q4:part==1?(void*)st.v_q4:nullptr;
+        if (fmt==kKvInt8) return part==0?(void*)st.k_q:part==1?(void*)st.v_q:part==2?(void*)st.k_scale:part==3?(void*)st.v_scale:nullptr;
+        return part==0?(void*)st.k_pool:part==1?(void*)st.v_pool:nullptr;
+    }
+    void fill_parts(QsaState& st,int fmt,int pages,uint8_t salt) {
+        std::vector<int32_t> table;
+        check(pool->snapshot_page_table(st,table,err),"read fixed mapping for pattern upload");
+        for (int part=0;part<4;++part) {
+            const size_t page_bytes=part_page_bytes(fmt,part);
+            if (!page_bytes) continue;
+            std::vector<uint8_t> logical((size_t)pages*page_bytes);
+            for (size_t i=0;i<logical.size();++i) logical[i]=(uint8_t)(salt+part*31+i*7+i/251);
+            for (int p=0;p<pages;++p)
+                cuda_check(cudaMemcpy((uint8_t*)part_base(st,fmt,part)+(size_t)table[(size_t)p]*page_bytes,
+                                      logical.data()+(size_t)p*page_bytes,page_bytes,cudaMemcpyHostToDevice));
+        }
+        const size_t index_bytes=(size_t)(pages+1)*g.idx_key_dim*sizeof(float);
+        std::vector<uint8_t> index(index_bytes);
+        for (size_t i=0;i<index.size();++i) index[i]=(uint8_t)(salt+157+i*7+i/251);
+        cuda_check(cudaMemcpy(st.idx_pooled,index.data(),index.size(),cudaMemcpyHostToDevice));
+        cuda_check(cudaDeviceSynchronize());
+    }
+    size_t k_page_bytes(int fmt) const { return part_page_bytes(fmt,0); }
+    void* k_base(QsaState& st,int fmt) { return part_base(st,fmt,0); }
+    void fill_k(QsaState& st,int fmt,int pages,uint8_t salt) { fill_parts(st,fmt,pages,salt); }
+    ~PooledFixture() {
+        for (void* p:tables) (void)cudaFree(p);
+        for (void* p:indexers) (void)cudaFree(p);
+    }
+};
+
+void pooled_snapshots(int fmt) {
+    constexpr int pages=18, capacity=128;
+    PooledFixture f(fmt,capacity);
+    for (int n=0;n<3;++n) check(f.pool->ensure(f.nth(n),0,pages*4,nullptr,f.err),"allocate small pooled state");
+    for (int n=0;n<3;++n) f.mapping(f.nth(n),pages,17+(uint32_t)n);
+    std::vector<int32_t> map_a,map_b;
+    check(f.pool->snapshot_page_table(f.a,map_a,f.err) && f.pool->snapshot_page_table(f.b,map_b,f.err) && map_a!=map_b,
+          "source and target have different fixed nonidentity mappings");
+    bool nonidentity=false;
+    for (int i=0;i<pages;++i) nonidentity |= map_a[(size_t)i]!=i;
+    check(nonidentity,"test fixture genuinely uses a nonidentity map");
+    f.fill_k(f.a,fmt,pages,(uint8_t)(19*fmt));
+
+    ConversationKv image;
+    check(conversation_kv_save(image,f.a,f.g,pages*4,true,f.err),"gather fixed nonidentity pages");
+    check(image.k.size()==(size_t)pages*f.k_page_bytes(fmt),"identity-layout snapshot byte size unchanged");
+    std::vector<uint8_t> expected(image.k.size()),got(expected.size());
+    for (size_t i=0;i<expected.size();++i) expected[i]=(uint8_t)(19*fmt+i*7+i/251);
+    check(image.k.read(got.data(),0,got.size()) && got==expected,"pooled gather equals logical bytes");
+
+    // Restore the same logical bytes into a differently mapped state. This is
+    // the layout-invariance check: merely permuting A's table would change its
+    // logical contents and is not a valid comparison.
+    check(conversation_kv_restore(image,f.b,f.g,pages*4,true,f.err),"restore same logical bytes into another mapping");
+    ConversationKv same;
+    check(conversation_kv_save(same,f.b,f.g,pages*4,true,f.err),"capture second physical layout");
+    check(equal(image,same),"snapshot independent of physical layout");
+    uint64_t fp_a=0,fp_b=0;
+    check(conversation_kv_verify(image,f.a,f.g,pages*4,true,fp_a,f.err) &&
+          conversation_kv_verify(image,f.b,f.g,pages*4,true,fp_b,f.err) && fp_a==fp_b,
+          "fingerprint independent of physical layout");
+
+    SessionKvSource source;
+    check(conversation_kv_source(source,f.a,f.g,pages*4,true,f.err),"SAVE source with fixed mapping");
+    for (size_t part=0;part<5;++part) {
+        const std::array<const ConversationBuffer*,5> parts={&image.k,&image.v,&image.k_scale,&image.v_scale,&image.pooled};
+        std::vector<uint8_t> out(source.sizes[part]),want(source.sizes[part]);
+        const size_t page_bytes=part<4?(size_t)source.sizes[part]/(size_t)pages:source.sizes[part];
+        const size_t first=out.empty()?0:std::min(out.size()-1,page_bytes-7);
+        check(source.read(part,0,out.data(),first) && source.read(part,first,out.data()+first,out.size()-first),
+              "small SAVE reads cross a logical page boundary");
+        check(parts[part]->read(want.data(),0,want.size()) && out==want,"SAVE source equals logical snapshot");
+    }
+    cuda_check(cudaDeviceSynchronize()); ConversationKv incremental=image;
+    size_t reused=0;
+    check(cudaGetLastError()==cudaSuccess,"clear prior asynchronous errors before incremental capture");
+    check(conversation_kv_save(incremental,f.a,f.g,pages*4,true,f.err,7,&reused) && equal(incremental,image) && reused>0,
+          "unchanged_tokens inside a page preserves full logical capture");
+    for (bool queued:{false,true}) {
+        check(conversation_kv_copy(f.a,f.b,f.g,pages*4,true,f.err,queued),"pooled direct copy queued false/true");
+        cuda_check(cudaDeviceSynchronize());
+        ConversationKv copied;
+        check(conversation_kv_save(copied,f.b,f.g,pages*4,true,f.err),"capture direct-copy target");
+        check(equal(copied,image),"direct copy preserves logical bytes in target mapping");
+    }
+    check(conversation_kv_restore(image,f.c,f.g,pages*4,true,f.err),"scatter restore into fresh pooled state");
+    ConversationKv restored;
+    check(conversation_kv_save(restored,f.c,f.g,pages*4,true,f.err),"capture restored QSA state");
+    check(equal(restored,image),"restore roundtrip");
+    check(conversation_kv_restore_prefix(image,f.c,f.g,pages*4,67,true,f.err),"restore non-page-aligned prefix");
+    ConversationKv actual_prefix;
+    check(conversation_kv_save(actual_prefix,f.c,f.g,67,true,f.err),"capture nonaligned restored prefix");
+    const std::array<const ConversationBuffer*,5> got_prefix={&actual_prefix.k,&actual_prefix.v,&actual_prefix.k_scale,&actual_prefix.v_scale,&actual_prefix.pooled};
+    const std::array<const ConversationBuffer*,5> captured={&image.k,&image.v,&image.k_scale,&image.v_scale,&image.pooled};
+    for (size_t part=0;part<5;++part) {
+        const size_t page_bytes=part<4?actual_prefix.k.size()/(size_t)((67+3)/4):0;
+        const size_t bytes=part==4?(size_t)actual_prefix.pooled_rows*f.g.idx_key_dim*sizeof(float)
+                                  :page_bytes?got_prefix[part]->size():0;
+        std::vector<uint8_t> got(bytes),want(bytes);
+        check(got_prefix[part]->read(got.data(),0,bytes) && captured[part]->read(want.data(),0,bytes) && got==want,
+              "nonaligned restore_prefix copies the exact logical prefix");
+    }
+
+    std::vector<int32_t> before_a,before_b;
+    check(f.pool->snapshot_page_table(f.a,before_a,f.err) && f.pool->snapshot_page_table(f.b,before_b,f.err),
+          "capture maps before exhaustion");
+    ConversationKv old_a,old_b;
+    check(conversation_kv_save(old_a,f.a,f.g,pages*4,true,f.err) &&
+          conversation_kv_save(old_b,f.b,f.g,pages*4,true,f.err),"capture old bytes before exhaustion");
+    QsaState filler=f.state(fmt,capacity-3*pages);
+    check(f.pool->ensure(filler,0,(capacity-3*pages)*4,nullptr,f.err),"fill every remaining pool page");
+    const int64_t free_before=f.pool->free_pages();
+    check(!conversation_kv_restore_many({&image,&image,&image},{&f.a,&f.b,&f.c},f.g,pages*4,pages*4,true,f.err),
+          "third-layer prepare exhausts pool");
+    std::vector<int32_t> after_a,after_b;
+    check(f.pool->snapshot_page_table(f.a,after_a,f.err) && f.pool->snapshot_page_table(f.b,after_b,f.err) &&
+          after_a==before_a && after_b==before_b && f.pool->free_pages()==free_before,
+          "failed prepare preserves maps and free count");
+    ConversationKv now_a,now_b;
+    check(conversation_kv_save(now_a,f.a,f.g,pages*4,true,f.err) &&
+          conversation_kv_save(now_b,f.b,f.g,pages*4,true,f.err) && equal(now_a,old_a) && equal(now_b,old_b),
+          "failed prepare preserves all old layer bytes");
+    check(f.pool->release(filler,nullptr,f.err),"release exhaustion filler");
+    (void)cudaFree(filler.page_table); (void)cudaFree(filler.idx_pooled);
+
+    std::vector<int32_t> retired=before_a;
+    check(f.pool->release(f.a,nullptr,f.err) && !f.pool->owns(f.a),"released conversation has no stale lease");
+    check(f.pool->ensure(f.a,0,4,nullptr,f.err),"recycle a physical page for another conversation");
+    cuda_check(cudaDeviceSynchronize());
+    const int32_t physical=f.pool->physical_page(f.a,0);
+    check(std::find(retired.begin(),retired.end(),physical)!=retired.end(),"new conversation really reuses an old physical page");
+    std::vector<uint8_t> padding(f.k_page_bytes(fmt),0xff);
+    cuda_check(cudaMemcpy(padding.data(),(uint8_t*)f.k_base(f.a,fmt)+(size_t)physical*f.k_page_bytes(fmt),
+                          padding.size(),cudaMemcpyDeviceToHost));
+    check(std::all_of(padding.begin(),padding.end(),[](uint8_t v){return v==0;}),"reused physical page has no stale padding");
+}
+
+void pooled_segment_crossing() {
+    // 4096 FP16 K pages are exactly 16 MiB. Use 4100 so one host interval
+    // crosses both the 4-cell physical-page boundary and the 16 MiB segment.
+    constexpr int pages=4100;
+    PooledFixture f(kKvF16,3*pages+8);
+    check(f.pool->ensure(f.a,0,pages*4,nullptr,f.err) && f.pool->ensure(f.b,0,pages*4,nullptr,f.err),
+          "allocate two large pooled states");
+    f.mapping(f.a,pages,101); f.mapping(f.b,pages,202);
+    f.fill_k(f.a,kKvF16,pages,37);
+    ConversationKv image;
+    check(conversation_kv_save(image,f.a,f.g,pages*4,true,f.err),"gather across 16 MiB segment boundary");
+    check(image.k.size()>(16u<<20),"large K payload really crosses ConversationBuffer segments");
+    const bool large_restore=conversation_kv_restore(image,f.b,f.g,pages*4,true,f.err);
+    check(large_restore,"scatter across 16 MiB segment boundary");
+    ConversationKv restored;
+    check(conversation_kv_save(restored,f.b,f.g,pages*4,true,f.err) && equal(image,restored),
+          "large gather/scatter roundtrip is byte exact");
+    SessionKvSource source;
+    check(conversation_kv_source(source,f.a,f.g,pages*4,true,f.err),"large SAVE source");
+    const size_t page_bytes=f.k_page_bytes(kKvF16);
+    const size_t offset=(16u<<20)-page_bytes-7;
+    const size_t bytes=2*page_bytes+14;
+    std::vector<uint8_t> streamed(bytes),captured(bytes);
+    check(source.read(0,offset,streamed.data(),streamed.size()) && image.k.read(captured.data(),offset,captured.size()) &&
+          streamed==captured,"one SAVE read crosses both a page and the 16 MiB segment boundary");
+    std::vector<uint8_t> all(source.sizes[0]),want(source.sizes[0]);
+    check(source.read(0,0,all.data(),all.size()) && image.k.read(want.data(),0,want.size()) && all==want,
+          "whole segmented SAVE stream equals captured logical bytes");
 }
 
 void full_session(int fmt, int mode, int experts) {
@@ -369,7 +600,7 @@ int main() {
                 check(std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}),"stale VRAM pages invalidated");
             }
             if (mode==2 && upto>0) {
-                const auto s=qsa_real_shapes();
+                const auto s=qsa_shapes(f.g);
                 const int64_t b1=(upto+s.page_size-1)/s.page_size,b0=std::max<int64_t>(0,b1-f.state.n_slots);
                 const size_t block=kv_block_bytes(s,fmt)/2;
                 // Codes and scales are separate in INT8; check code bytes here.
@@ -405,5 +636,7 @@ int main() {
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);
+    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) pooled_snapshots(fmt);
+    pooled_segment_crossing();
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

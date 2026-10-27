@@ -402,10 +402,11 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
-    for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
-            return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
+    std::vector<const ConversationKv*> images;
+    std::vector<QsaState*> states;
+    for (size_t j = 0; j < owned_qsa(ss); ++j) { images.push_back(&image.kv[j]); states.push_back(&ss.qsa_states[ss.qsa_ord0 + j]); }
+    if (!conversation_kv_restore_many(images, states, g, upto, upto, true, error) ||
+        (draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
@@ -455,9 +456,11 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
         return ConversationRestore::invalid;
     }
     if (!sync(error)) return ConversationRestore::transfer_failed;
-    for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore_prefix(image.kv[j], owned(ss, j), g, captured, upto, true, error))
-            return ConversationRestore::transfer_failed;
+    std::vector<const ConversationKv*> images;
+    std::vector<QsaState*> states;
+    for (size_t j = 0; j < owned_qsa(ss); ++j) { images.push_back(&image.kv[j]); states.push_back(&ss.qsa_states[ss.qsa_ord0 + j]); }
+    if (!conversation_kv_restore_many(images, states, g, captured, upto, true, error))
+        return ConversationRestore::transfer_failed;
     if (draft && !conversation_kv_restore_prefix(image.kv.back(), *draft, g, captured, upto, false, error))
         return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;

@@ -2,6 +2,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
+#include "kv_pool.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -88,7 +89,8 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
 bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error) {
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
-        (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
+        (st.kv_mode == 0 && !st.kv_pool && st.n_slots < st.n_pages) ||
+        (st.kv_pool && (st.kv_mode != 0 || st.kv_elastic >= 0 || !st.page_table)) ||
         l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
         return false;
@@ -119,6 +121,87 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
 }
+
+struct PageView {
+    QsaState* mutable_state = nullptr;
+    GlobalKvPool* pool = nullptr;
+    const QsaState* state = nullptr;
+    std::shared_ptr<const std::vector<int32_t>> owned_table;
+    const std::vector<int32_t>* table = nullptr;
+    std::array<size_t, 5> page_bytes{};
+    std::array<const std::vector<int32_t>*, 5> part_tables{};
+};
+
+bool page_view(PageView& view, const QsaState& st, const Layout& l, int64_t upto,
+               std::string& error, const std::vector<int32_t>* prepared = nullptr) {
+    view.pool = st.kv_pool;
+    view.mutable_state = const_cast<QsaState*>(&st);
+    view.state = &st;
+    const size_t cells = (size_t) l.cells;
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    // copy_logical_range() divides a logical byte offset by page_bytes and scales the physical page number by it,
+    // so page_bytes must be the size of ONE PHYSICAL PAGE - the page table maps granules, not cells. sizes[i] is the
+    // whole-part byte count over `cells` cells, so per-cell bytes are sizes[i]/cells and one page is that times the
+    // page granule (l.page_size cells). (Passing per-cell bytes made every pooled page straddle four physical pages.)
+    for (size_t i = 0; i < 4; ++i) view.page_bytes[i] = cells ? (sizes[i] / cells) * (size_t) l.page_size : 0;
+    if (!st.kv_pool) return true;
+    if (st.kv_mode != 0 || st.kv_elastic >= 0 || !st.page_table ||
+        l.cells / l.page_size > st.n_pages) {
+        error = "conversation snapshot: invalid pooled QSA state";
+        return false;
+    }
+    if (prepared) {
+        // publish_prepared() consumes and erases the transaction entry. Own the
+        // table so scatter never retains a pointer into that erased entry.
+        view.owned_table = std::make_shared<std::vector<int32_t>>(*prepared);
+        view.table = view.owned_table.get();
+        for (size_t i = 0; i < view.part_tables.size(); ++i) view.part_tables[i] = view.table;
+    } else if (l.cells) {
+        auto table = std::make_shared<std::vector<int32_t>>();
+        if (!st.kv_pool->snapshot_page_table(st, *table, error)) return false;
+        view.owned_table = std::move(table);
+        view.table = view.owned_table.get();
+        for (size_t i = 0; i < view.part_tables.size(); ++i) view.part_tables[i] = view.table;
+    } else {
+        return true;   // an empty snapshot needs no lease
+    }
+    if (!view.table || view.table->size() != (size_t) st.n_pages) {
+        error = "conversation snapshot: invalid pooled page-table mirror";
+        return false;
+    }
+    const int64_t pages = (upto + l.page_size - 1) / l.page_size;
+    for (int64_t i = 0; i < pages; ++i) {
+        const int32_t physical = (*view.table)[(size_t) i];
+        if (physical < 0 || physical >= st.kv_pool->pages()) {
+            error = "conversation snapshot: pooled logical page is not resident";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool copy_pages(const PageView& view, const std::array<void*, 5>& flat, size_t part,
+                size_t offset, void* host, size_t bytes, bool scatter,
+                std::string& error, bool queued = false) {
+    if (!bytes) return true;
+    const QsaState& st = *view.state;
+    if (!st.kv_pool || part == 4) {
+        void* device = static_cast<uint8_t*>(flat[part]) + offset;
+        return transfer(scatter ? device : host, scatter ? host : device, bytes, error);
+    }
+    if (!flat[part] || !host || !view.page_bytes[part] || !view.table) {
+        error = "conversation snapshot: missing pooled state buffer or page table";
+        return false;
+    }
+    const cudaError_t e = conversation_detail::copy_logical_range(
+        flat[part], view.page_bytes[part], view.part_tables[part], offset, host, bytes, scatter, queued);
+    if (e == cudaSuccess) return true;
+    error = std::string("conversation snapshot logical-page copy: ") + cudaGetErrorString(e) +
+            " (part=" + std::to_string(part) + ", logical_offset=" + std::to_string(offset) +
+            ", bytes=" + std::to_string(bytes) + ", page_bytes=" + std::to_string(view.page_bytes[part]) + ")";
+    return false;
+}
+
 } // namespace
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -163,6 +246,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     image.pooled_rows = l.pooled_rows;
     image.idx_dim = g.idx_key_dim;
     const auto src = pools(st);
+    PageView view;
+    if (!page_view(view, st, l, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     for (size_t i = 0; i < dst.size(); ++i) {
@@ -173,6 +258,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                if (st.kv_pool && i < 4)
+                    return copy_pages(view, src, i, at, p, n, false, error);
                 return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
@@ -238,11 +325,53 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     const auto src = pools(from);
     const auto dst = pools(to);
     const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
+    PageView source, target;
+    KvLeaseTxn txn;
+    bool replacement = false;
+    auto abort = [&] {
+        (void) conversation_detail::synchronize_private_stream();
+        if (replacement) to.kv_pool->abort_prepare(txn);
+    };
+    if (!page_view(source, from, lf, upto, error)) return false;
+    if (to.kv_pool && lf.cells) {
+        QsaState& mutable_to = const_cast<QsaState&>(to);
+        if (!to.kv_pool->prepare_prefix(mutable_to, lf.cells, txn, error)) return false;
+        replacement = true;
+        auto entry = std::find_if(txn.entries.begin(), txn.entries.end(),
+                                  [&](const auto& e) { return e.state == &mutable_to; });
+        if (entry == txn.entries.end()) { error = "conversation snapshot: missing prepared target"; abort(); return false; }
+        cudaStream_t copy_stream = nullptr;
+        if (const cudaError_t e = conversation_detail::private_stream(copy_stream); e != cudaSuccess) {
+            error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); abort(); return false;
+        }
+        // publish_prepared() erases the entry; scatter must own its page table.
+        target.owned_table = std::make_shared<std::vector<int32_t>>(entry->table);
+        if (!page_view(target, to, lt, upto, error, target.owned_table.get()) ||
+            !to.kv_pool->publish_prepared(mutable_to, txn, copy_stream, error)) { abort(); return false; }
+        // Same ordering as restore: land the publish zero/upload before the scatter reads the table / writes pages.
+        if (const cudaError_t _se = cudaDeviceSynchronize(); _se != cudaSuccess) {
+            error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(_se); abort(); return false;
+        }
+    } else if (!page_view(target, to, lt, upto, error)) return false;
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (!sizes[i]) continue;
-        if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
-        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
-        if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+        if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; abort(); return false; }
+        cudaError_t e = cudaSuccess;
+        if (from.kv_pool && i < 4) {
+            auto* logical = static_cast<uint8_t*>(src[i]);
+            e = conversation_detail::copy_logical_range(dst[i], target.page_bytes[i], target.part_tables[i],
+                                                       0, logical, sizes[i], true, queued,
+                                                       source.part_tables[i]);
+        } else {
+            e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
+        }
+        if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); abort(); return false; }
+    }
+    if (replacement) {
+        if (const cudaError_t e = conversation_detail::synchronize_private_stream(); e != cudaSuccess) {
+            error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); abort(); return false;
+        }
+        to.kv_pool->finish_prepared(txn);
     }
     if (queued && to.kv_mode != 0) {
         const cudaError_t e = conversation_detail::order_after_queued();
@@ -254,13 +383,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
-        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
-            })) return false;
-    return refresh_residency(st, g, upto, error);
+    return conversation_kv_restore_many({&image}, {const_cast<QsaState*>(&st)}, g, upto, upto, index, error);
 }
 
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -270,18 +393,92 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
         return false;
     }
     if (!conversation_kv_validate(image, st, g, captured, index, error)) return false;
-    Layout l{};   // the prefix's extent; validation above checked the image against the captured one
-    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
-    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    for (size_t i = 0; i < src.size(); ++i)
-        if (sizes[i] > src[i]->size()) { error = "conversation snapshot: prefix beyond the K/V payload"; return false; }
-    const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
-        if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
-            })) return false;
-    return refresh_residency(st, g, upto, error);
+    return conversation_kv_restore_many({&image}, {const_cast<QsaState*>(&st)}, g, captured, upto, index, error);
+}
+
+bool conversation_kv_restore_many(const std::vector<const ConversationKv*>& images,
+                                  const std::vector<QsaState*>& states, const ModelGeometry& g,
+                                  int64_t captured, int64_t upto, bool index, std::string& error) {
+    if (images.size() != states.size() || upto < 0 || upto > captured) {
+        error = "conversation snapshot: invalid multi-layer restore";
+        return false;
+    }
+    std::vector<Layout> layouts(images.size());
+    std::vector<PageView> views(images.size());
+    std::vector<std::array<void*, 5>> destinations(images.size());
+    std::vector<std::array<size_t, 5>> sizes(images.size());
+    KvLeaseTxn txn;
+    bool replacement = false;
+    auto abort = [&] {
+        (void) conversation_detail::synchronize_private_stream();
+        if (replacement) states.front()->kv_pool->abort_prepare(txn);
+    };
+    // Validate and prepare everything before publishing any layer. All main
+    // layers of one stage share a pool; a non-pooled draft is never in `states`.
+    for (size_t j = 0; j < images.size(); ++j) {
+        const auto& image = *images[j];
+        QsaState& st = *states[j];
+        if (!conversation_kv_validate(image, st, g, captured, index, error) ||
+            !layout(st, g, upto, index, layouts[j], error) ||
+            !valid(st, layouts[j], upto, error)) return false;
+        const Layout& l = layouts[j];
+        sizes[j] = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+        const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+        for (size_t i = 0; i < src.size(); ++i)
+            if (sizes[j][i] > src[i]->size()) { error = "conversation snapshot: prefix beyond the K/V payload"; return false; }
+        destinations[j] = pools(st);
+        if (st.kv_pool && l.cells) {
+            if (j == 0) replacement = true;
+            if (!states.front()->kv_pool || states.front()->kv_pool != st.kv_pool ||
+                !st.kv_pool->prepare_prefix(st, l.cells, txn, error)) { abort(); return false; }
+            auto entry = std::find_if(txn.entries.begin(), txn.entries.end(),
+                                      [&](const auto& e) { return e.state == &st; });
+            if (entry == txn.entries.end()) { abort(); return false; }
+            // Publishing erases this entry; keep the prepared mapping alive.
+            views[j].owned_table = std::make_shared<std::vector<int32_t>>(entry->table);
+            if (!page_view(views[j], st, l, upto, error, views[j].owned_table.get())) {
+                abort(); return false;
+            }
+        } else if (!page_view(views[j], st, l, upto, error)) { abort(); return false; }
+    }
+    cudaStream_t copy_stream = nullptr;
+    if (replacement) {
+        if (const cudaError_t e = conversation_detail::private_stream(copy_stream); e != cudaSuccess) {
+            error = std::string("conversation snapshot restore: ") + cudaGetErrorString(e); abort(); return false;
+        }
+    }
+    for (size_t j = 0; j < states.size(); ++j)
+        if (states[j]->kv_pool && layouts[j].cells &&
+            !states[j]->kv_pool->publish_prepared(*states[j], txn, copy_stream, error)) { abort(); return false; }
+    // The page table publish (publish_prepared -> publish: an async zero of every newly acquired physical page and an
+    // async H2D upload of the mirrored page table) and this scatter use independent streams of the pool; a scatter
+    // that reads a page table or writes a page mid-zero is not ordered against them, so a handful of pages can come
+    // back stale. Restore is a checkpoint-load path, never hot, so quiesce the device once here before scattering:
+    // every publish zero/upload has landed and the scatter sees the final table and clean pages.
+    if (replacement) {
+        const cudaError_t _se = cudaDeviceSynchronize();
+        if (_se != cudaSuccess) { error = std::string("restore pre-scatter sync: ") + cudaGetErrorString(_se); abort(); return false; }
+    }
+    for (size_t j = 0; j < states.size(); ++j) {
+        const auto& image = *images[j];
+        const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+        for (size_t i = 0; i < src.size(); ++i)
+            if (!src[i]->visit(0, sizes[j][i], [&](const uint8_t* p, size_t n, size_t at) {
+                    if (states[j]->kv_pool && i < 4)
+                        return copy_pages(views[j], destinations[j], i, at,
+                                          const_cast<uint8_t*>(p), n, true, error);
+                    return transfer(static_cast<uint8_t*>(destinations[j][i]) + at, p, n, error);
+                })) { abort(); return false; }
+    }
+    if (replacement) {
+        if (const cudaError_t e = conversation_detail::synchronize_private_stream(); e != cudaSuccess) {
+            error = std::string("conversation snapshot restore: ") + cudaGetErrorString(e); abort(); return false;
+        }
+        states.front()->kv_pool->finish_prepared(txn);
+    }
+    for (size_t j = 0; j < states.size(); ++j)
+        if (!refresh_residency(*states[j], g, upto, error)) return false;
+    return true;
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
@@ -302,9 +499,12 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const auto src = pools(st);
     const auto sizes = s.sizes;
+    auto view = std::make_shared<PageView>();
+    if (!page_view(*view, st, l, upto, error)) return false;
     auto why = std::make_shared<std::string>();
-    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+    s.read = [src, sizes, why, view](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
+        if (view->pool && part < 4) return copy_pages(*view, src, part, offset, dst, n, false, *why);
         return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
     };
     s.error = [why] { return *why; };
@@ -317,10 +517,19 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
-    auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {
+    const auto authoritative = pools(st);
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    PageView view;
+    if (!page_view(view, st, l, upto, error)) return false;
+    auto compare = [&](size_t part, const uint8_t* expected, size_t logical_offset,
+                       const void* device, size_t bytes, bool include_hash) {
         for (size_t offset = 0; offset < bytes;) {
             const size_t n = std::min(buffer.size(), bytes - offset);
-            if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error)) return false;
+            if (st.kv_pool && part < 4) {
+                if (!copy_pages(view, authoritative, part, logical_offset + offset,
+                                buffer.data(), n, false, error)) return false;
+            } else if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error)) return false;
             if (std::memcmp(buffer.data(), expected + offset, n) != 0) {
                 error = "conversation snapshot: restored K/V bytes differ";
                 return false;
@@ -331,10 +540,9 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
         return true;
     };
     const std::array<const ConversationBuffer*, 5> saved = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    const auto authoritative = pools(st);
     for (size_t i = 0; i < saved.size(); ++i)
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
+                return compare(i, p, at, static_cast<const uint8_t*>(authoritative[i]) + at, n, true);
             })) return false;
     if (st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
@@ -347,7 +555,7 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
                 if (!saved[i]->visit(size_t(page) * page_bytes, page_bytes,
                         [&](const uint8_t* p, size_t n, size_t at) {
                             const size_t offset = size_t(page % st.n_slots) * page_bytes + at - size_t(page) * page_bytes;
-                            return compare(static_cast<const uint8_t*>(resident[i]) + offset, p, n, false);
+                            return compare(i, p, at, static_cast<const uint8_t*>(resident[i]) + offset, n, false);
                         })) return false;
         }
     }
