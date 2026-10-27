@@ -5432,6 +5432,51 @@ int main(int argc, char** argv) {
         return n;
     };
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+    // A slot's QsaStates borrow storage from the pool, but own their leases.
+    // Release those leases before destroying or truncating a SessionState;
+    // otherwise the pool retains a dangling QsaState* and its pages forever.
+    auto release_slot_session = [&](strata::core::SessionState& session, size_t stage, size_t slot) {
+        bool pooled = false;
+        for (int64_t j = 0; session.qsa_states != nullptr && j < session.qsa_alloc; ++j)
+            pooled = pooled || session.qsa_states[session.qsa_ord0 + j].kv_pool != nullptr;
+        if (!pooled) return;   // the unpooled default has no new sync or output
+        const cudaError_t sync = cudaDeviceSynchronize();
+        if (sync != cudaSuccess) {
+            std::fprintf(stderr, "strata kv_pool: slot %zu stage %zu release sync: %s\n",
+                         slot, stage, cudaGetErrorString(sync));
+            return;   // never recycle pages while device work may still use them
+        }
+        for (int64_t j = 0; j < session.qsa_alloc; ++j) {
+            strata::core::QsaState& st = session.qsa_states[session.qsa_ord0 + j];
+            if (st.kv_pool == nullptr) continue;
+            const int64_t before = st.kv_pool->free_pages();
+            std::string error;
+            if (!st.kv_pool->release(st, nullptr, error)) {
+                std::fprintf(stderr, "strata kv_pool: slot %zu stage %zu layer %lld release: %s\n",
+                             slot, stage, (long long) j, error.c_str());
+                continue;
+            }
+            const int64_t freed = st.kv_pool->free_pages() - before;
+            static const bool debug = [] {
+                const char* v = std::getenv("STRATA_KV_POOL_DEBUG");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            if (debug && freed != 0)
+                std::fprintf(stderr, "strata kv_pool: release slot=%zu stage=%zu layer=%lld owner=%p pages=%lld free=%lld\n",
+                             slot, stage, (long long) j, (void*) &st, (long long) freed,
+                             (long long) st.kv_pool->free_pages());
+        }
+    };
+    auto shrink_slot_sessions = [&](size_t keep) {
+        for (size_t k = 0; k < bslot_ss.size(); ++k) {
+            if (keep >= bslot_ss[k].size()) continue;
+            const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+            for (size_t b = keep; b < bslot_ss[k].size(); ++b)
+                release_slot_session(*bslot_ss[k][b], k, b);
+            bslot_ss[k].resize(keep);
+        }
+    };
+    auto clear_slot_sessions = [&] { shrink_slot_sessions(0); bslot_ss.clear(); };
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -5512,18 +5557,18 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
-        for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
+        shrink_slot_sessions((size_t) std::max(fit, 0));   // the same count on every stage
         if (fit < 2) {
             std::fprintf(stderr, "strata generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
                                  "--max-context or KV streaming, --kv-resident, makes them smaller)\n");
-            bslot_ss.clear();
+            clear_slot_sessions();
             o.batch = 0;
         } else {
             const int n = slots_in_windows(fit);   // (the slots that fit are held to kVerifyMaxT rows per group too)
             if (n < fit) {
                 std::fprintf(stderr, "strata generate: WARNING: --batch: %d slot sessions fit, and a batch window holds "
                                      "at most %d rows, so %d slots\n", fit, (int) strata::kernels::kVerifyMaxT, n);
-                for (auto& v : bslot_ss) v.resize((size_t) n);
+                shrink_slot_sessions((size_t) n);
                 fit = n;
             }
             o.batch = fit;
@@ -14204,6 +14249,19 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 if (!sp_ok) {
+                    // A KV pool exhaustion (no free pages for this chunk) is a per-request, recoverable
+                    // condition: this request fails and reports ERR, but a later, smaller request still fits,
+                    // so the process MUST keep serving. The plan's step 5 requires fail-closed (no write, no
+                    // kernel reading -1/out of range) WITHOUT ending the engine. Only a real CUDA fault
+                    // poisons the context for the whole process; that one still leaves at once.
+                    const bool pool_exhausted = err.find("kv_pool") != std::string::npos;
+                    if (pool_exhausted && cudaPeekAtLastError() == cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: %s (request ends; the engine keeps serving)\n", err.c_str());
+                        std::printf("ERR %s\n", err.c_str());
+                        std::fflush(stdout);
+                        cancelled = true;   // refill the lent slots below, then DONE; keep the process up
+                        break;
+                    }
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
@@ -15782,6 +15840,7 @@ int main(int argc, char** argv) {
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+        clear_slot_sessions();   // QSA leases must not outlive their SessionState owners
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here
