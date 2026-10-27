@@ -1330,6 +1330,14 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
+    def _parse_pool(self, line):
+        """--kv-pool: `POOL free=<n> high_water=<n> pages=<n>` after a request; refresh the live watermark the
+        Monitor tab and Prometheus read (INFO is a startup snapshot). Key names match the INFO fields."""
+        for tok in line.split()[1:]:
+            k, eq, v = tok.partition("=")
+            if eq and k in ("free", "high_water", "pages") and v.lstrip("-").isdigit():
+                self.info["kv_pool_" + k] = int(v)
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -1520,6 +1528,8 @@ class StrataEngine:
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
+            elif line.startswith("POOL "):               # --kv-pool: live watermark after a request
+                self._parse_pool(line)
             elif line.startswith("BADM "):
                 f = line.split()
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
@@ -2266,6 +2276,8 @@ class StrataEngine:
                         read_to = self.reused = int(line.split()[1])
                     except (IndexError, ValueError):
                         pass
+                elif line.startswith("POOL "):
+                    self._parse_pool(line)
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True

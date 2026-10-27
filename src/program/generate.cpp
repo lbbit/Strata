@@ -15541,6 +15541,16 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+            // --kv-pool: one thin POOL line BEFORE DONE (DONE stays the request's last line) so the server's request
+            // reader parses it before it returns on DONE and refreshes its live watermark (INFO is a startup snapshot).
+            // Not emitted without the pool, so the default stream is unchanged.
+            if (o.kv_pool && primary_kv_pool) {
+                std::printf("POOL free=%lld high_water=%lld pages=%lld\n",
+                            (long long) primary_kv_pool->free_pages(),
+                            (long long) primary_kv_pool->high_water_pages(),
+                            (long long) primary_kv_pool->pages());
+                std::fflush(stdout);
+            }
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
                         "experts_streamed=%lld\n",
                         (long long) produced_n,
