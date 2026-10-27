@@ -388,6 +388,7 @@ function renderAbout(eng, hw, st) {
     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
+    ["KV pool", eng.kv_pool_pages ? `${fmt((eng.kv_pool_pages || 0) - (eng.kv_pool_free || 0))} / ${fmt(eng.kv_pool_pages)} pages in use (${Math.round(100 * ((eng.kv_pool_pages || 0) - (eng.kv_pool_free || 0)) / (eng.kv_pool_pages || 1))}%), shared logical-page pool` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],

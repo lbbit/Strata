@@ -11219,6 +11219,16 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            // Tail INFO facts appended after engine=. The default (no batch, no --kv-pool) is empty so a run without
+            // these features reports byte-identical INFO. --kv-pool exposes its real page watermarks, which the
+            // Monitor tab (engine.kv_pool_*) and Prometheus (strata:kv_pool_*) show as live pool usage. Owned here so
+            // the c_str() stays valid through the printf below.
+            std::string info_tail;
+            if (o.batch > 0) info_tail += " batch_slots=" + std::to_string(o.batch) +
+                                         " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                         " batch_groups=" + std::to_string(o.batch_groups);
+            if (o.kv_pool && primary_kv_pool) info_tail += " kv_pool_pages=" + std::to_string(primary_kv_pool->pages()) +
+                                                          " kv_pool_free=" + std::to_string(primary_kv_pool->free_pages());
             std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
@@ -11243,10 +11253,7 @@ int main(int argc, char** argv) {
                         (long long) o.prefill_chunk, sp.stage_count(),
                         (long long) strata::prefill::Prefill::stream_all_min_tokens(),
                         strata::prefill::Prefill::pipe_setting(),
-                        o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
-        }
+                        info_tail.c_str());        }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every

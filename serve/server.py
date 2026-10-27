@@ -4625,6 +4625,14 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
+        # --kv-pool exposes its page watermarks in the engine INFO (kv_pool_pages/kv_pool_free); surface them as
+        # gauges only when present, so a run without the pool is unchanged.
+        info = getattr(self.engine, "info", {}) or {}
+        if "kv_pool_pages" in info:
+            rows += [
+                ("strata:kv_pool_pages", "gauge", "KV pool total logical pages", info.get("kv_pool_pages") or 0),
+                ("strata:kv_pool_free", "gauge", "KV pool free logical pages", info.get("kv_pool_free") or 0),
+            ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
