@@ -276,6 +276,22 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  // concurrency: the engine's batch width and what is running/waiting right now (needs --batch; else single).
+  {
+    const par = live.parallel || 0;
+    const slots = Array.isArray(live.slots) ? live.slots : [];
+    let line;
+    if (par > 0 || slots.length) {
+      const busy = slots.filter((s) => s.state !== "idle").length;
+      const parts = slots.map((s) => s.state === "idle" ? `#${s.slot} idle`
+        : `#${s.slot} ${s.state}${s.tok_s ? ` ${fmt(s.tok_s, 1)}t/s` : ""}`);
+      line = `${slots.length || par}-way parallel · ${live.running ?? busy} running · ${live.waiting ?? 0} waiting`
+        + (parts.length ? ` — ${parts.join(", ")}` : "");
+    } else {
+      line = `single request at a time${live.queued ? ` · ${live.queued} queued` : ""} (no --batch)`;
+    }
+    $("conc-detail").textContent = live.state !== "unloaded" ? line : "";
+  }
 
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
@@ -331,6 +347,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
+  // KV pool occupancy (--kv-pool): pages in use / total, refreshed live by the engine's POOL line.
+  {
+    const pg = eng.kv_pool_pages, pf = eng.kv_pool_free;
+    if (typeof pg === "number" && pg > 0) {
+      const used = pg - (pf || 0), p = Math.round(100 * used / pg);
+      $("kvpool-text").textContent = `${fmt(used)} / ${fmt(pg)} pages (${p}%)`;
+      $("kvpool-bar").style.width = `${p}%`;
+    } else {
+      $("kvpool-text").textContent = "off (no --kv-pool)";
+      $("kvpool-bar").style.width = "0%";
+    }
+  }
   $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
   $("ram-bar").style.width = `${ramPct}%`;
